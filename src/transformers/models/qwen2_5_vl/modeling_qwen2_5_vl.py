@@ -56,9 +56,38 @@ if is_torch_flex_attn_available():
 
     from ...integrations.flex_attention import make_flex_block_causal_mask
 
-
+from ...PACT.utils import custom_token_reduction, custom_pruning, token_reduction, token_reduction_tome, token_reduction_kmeans, token_reduction_dpc, token_reduction_agglomerative, token_reduction_dbscan, load_config
+pact_config = load_config()
+# print(pact_config)
 logger = logging.get_logger(__name__)
 
+
+import time
+
+
+def get_key_query_value(hidden_states, decoder_layer, real_position_ids, position_embeddings, get_only_k=False) :
+
+    hidden_states_normalized= decoder_layer.input_layernorm(hidden_states)
+    current_k=decoder_layer.self_attn.k_proj(hidden_states_normalized) 
+    bsz, q_len, _ = current_k.size()
+    current_k_cosine = current_k.view(bsz, q_len, decoder_layer.self_attn.num_key_value_heads, decoder_layer.self_attn.head_dim).transpose(1, 2)
+    cos, sin = position_embeddings
+    if get_only_k :
+        current_k_cosine, _= apply_multimodal_rotary_pos_emb(
+    current_k_cosine, current_k_cosine, cos, sin, decoder_layer.self_attn.rope_scaling["mrope_section"]
+)
+        current_k_cosine=current_k_cosine.transpose(1, 2).flatten(2,3)
+        return current_k,current_k_cosine
+
+    current_q=decoder_layer.self_attn.q_proj(hidden_states_normalized) 
+    current_q_cosine = current_q.view(bsz, q_len, decoder_layer.self_attn.num_heads, decoder_layer.self_attn.head_dim).transpose(1, 2)  
+    current_k_cosine, current_q_cosine = apply_multimodal_rotary_pos_emb(
+    current_k_cosine, current_q_cosine, cos, sin, decoder_layer.self_attn.rope_scaling["mrope_section"]
+)
+    current_k_cosine=current_k_cosine.transpose(1, 2).flatten(2,3)
+    current_q_cosine=current_q_cosine.transpose(1, 2).flatten(2,3)
+
+    return current_k, current_q, current_k_cosine, current_q_cosine
 
 class Qwen2_5_VLMLP(nn.Module):
     def __init__(self, config, bias: bool = False):
@@ -1162,16 +1191,39 @@ class Qwen2_5_VLTextModel(Qwen2_5_VLPreTrainedModel):
         )
 
         hidden_states = inputs_embeds
+        # import pdb
+        # pdb.set_trace()
+        image_in_input=position_ids.shape[0]==4 and position_ids[3:,:,:].bool().any()
+        
+        if image_in_input :
+            real_position_ids=position_ids[:3,:,:]
+
+        else :
+            real_position_ids=position_ids
+
+        if not hasattr(self,"total_el") :
+            self.total_el=0
+            if pact_config.get_performance_metrics :
+                self.total_algo_time=0
+            self.mean_visual_tokens_all=[0,0]
+            self.key_dist_stats={k:[0,0] for k in range(len(self.layers))}
+            # calculate layer of reduction for VTW
+            if pact_config.VTW_equivalant_layer_for_reduction != -1 :
+                reduction_perc_total=1-(1-pact_config.equivalent_reduc_percentage_vtw)*((len(self.layers)-pact_config.VTW_equivalant_layer_for_reduction)/len(self.layers))
+                pact_config.layer_for_reduction=round(reduction_perc_total*len(self.layers))                    
+                print(f"new reduction layer set to {pact_config.layer_for_reduction}")
 
         # create position embeddings to be shared across the decoder layers
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        position_embeddings = self.rotary_emb(hidden_states, real_position_ids)
 
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
         next_decoder_cache = None
-
-        for decoder_layer in self.layers:
+        weights_forward=None
+        for index, decoder_layer in enumerate(self.layers):
+            # import pdb
+            # pdb.set_trace()
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -1188,6 +1240,286 @@ class Qwen2_5_VLTextModel(Qwen2_5_VLPreTrainedModel):
                     position_embeddings,
                 )
             else:
+                
+                # print(f"当前分配显存: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
+                # code for redution is here
+                import time 
+                if pact_config.visual_token_reduction :
+                    is_reduction_layer_or_after=index>=pact_config.layer_for_reduction
+                    is_reduction_layer=(index==pact_config.layer_for_reduction or (pact_config.progessive_reduction and is_reduction_layer_or_after))
+                    start = time.time()
+                    if image_in_input and is_reduction_layer and position_ids[3:,:,:].bool().any()  : 
+                        
+                        if pact_config.get_performance_metrics :
+                            torch.cuda.synchronize()
+                            start_algo=time.time()
+                        is_image = position_ids[3:,:,:].bool().squeeze()
+                        if  pact_config.need_kq :
+                            last_true_idx = torch.where(is_image)[0].max()
+                            is_image_indices = torch.where(is_image)[0]
+                            if is_image_indices.numel() > 0:
+                                last_true_idx = is_image_indices.max()
+                            else:
+                                last_true_idx = -1
+
+                            is_not_text = torch.zeros_like(is_image, dtype=torch.float)
+                            is_not_text[:last_true_idx + 1] = 1
+                            is_not_text=is_not_text.bool()
+
+                        if index==pact_config.layer_for_reduction and image_in_input:
+                            if pact_config.synchro:
+                                self.mean_visual_tokens_all[1]+=len(self.layers)*is_image.sum().item()
+                            self.total_el+=1
+                            
+                        if not hasattr(self, 'reduction') :
+                            self.reduction=[0,0]
+
+                        if  pact_config.need_kq :
+                            current_k,current_q,current_k_cosine,current_q_cosine=get_key_query_value(hidden_states,decoder_layer,real_position_ids,position_embeddings=position_embeddings)
+                            vector_to_use_in_distance_clustering=eval(pact_config.vector_to_use_in_distance_clustering)
+
+                        ## pruning based reduction starts here
+                        if pact_config.token_pruning :
+                            if pact_config.use_cosine_in_token_pruning :
+                                if pact_config.use_all_non_text_pruning :
+                                    current_k_image=current_k_cosine[:,is_not_text]
+                                else :
+                                    current_k_image=current_k_cosine[:,is_image]
+                                current_q_image=current_q_cosine[:,is_not_text]
+                            else :
+                                if pact_config.use_all_non_text_pruning :
+                                    current_k_image=current_k[:,is_not_text]
+                                else :
+                                    current_k_image=current_k[:,is_image]
+                                current_q_image=current_q[:,is_not_text]
+                            bsz, q_len, _ = current_q_image.size()
+                            current_k_image = current_k_image.view(bsz, -1, decoder_layer.self_attn.num_key_value_heads, decoder_layer.self_attn.head_dim).transpose(1, 2)
+                            current_k_image = repeat_kv(current_k_image, decoder_layer.self_attn.num_key_value_groups)
+                            current_q_image = current_q_image.view(bsz, q_len, decoder_layer.self_attn.num_heads, decoder_layer.self_attn.head_dim).transpose(1, 2)
+
+                            if pact_config.use_custom_pruning  :
+                                scores=custom_pruning(current_k_image,current_q_image)
+                                if pact_config.use_all_non_text_pruning :
+                                    scores=scores[:,is_image[is_not_text]]
+                            else :
+                                if pact_config.use_attention_in_token_pruning :
+                                    #for fastv
+                                    global_q=current_q_image
+                                else :
+                                    #for pact
+                                    global_q=torch.mean(current_q_image,dim=2,keepdim=True)
+                                if pact_config.do_not_upcast_to_full_precision_for_pruning :
+                                    scores=torch.matmul(global_q/math.sqrt(decoder_layer.self_attn.head_dim,),current_k_image.transpose(-2,-1))
+                                else :
+                                    scores=torch.matmul(global_q.to(torch.float32)/math.sqrt(decoder_layer.self_attn.head_dim,),current_k_image.to(torch.float32).transpose(-2,-1))
+                                if pact_config.use_attention_in_token_pruning and pact_config.use_mask_in_use_attention_in_token_pruning:
+                                    causal_mask_att_calculation = torch.triu(torch.ones((q_len, q_len), device=global_q.device), diagonal=1).bool()
+                                    if not pact_config.use_all_non_text_pruning :
+                                        causal_mask_att_calculation=causal_mask_att_calculation[:,is_image[is_not_text]]
+                                    scores = scores.masked_fill(causal_mask_att_calculation, float('-inf'))
+
+                                scores=torch.softmax(scores,dim=-1,dtype=torch.float32).mean(1)
+                                scores = torch.nan_to_num(scores, nan=0.0)
+                                
+                                if pact_config.use_attention_in_token_pruning :
+                                    scores=scores.mean(-2)
+                                else :    
+                                    scores=scores.squeeze(-2)
+                                if pact_config.use_all_non_text_pruning :
+                                    scores=scores[:,is_image[is_not_text]]
+                            
+                                if pact_config.multiply_by_norm :
+                                    norm=torch.norm(hidden_states[:,is_image].to(torch.float32), dim=-1,p=pact_config.norm_to_use).squeeze()
+                                    scores=scores.to(torch.float32)*norm
+
+                            if pact_config.avoid_numerical_instability_prune and pact_config.pruning_filter_wth_percentage:
+                                scores= scores.squeeze()
+                                sorted_indices = torch.argsort(scores)
+                                ranks = torch.empty_like(sorted_indices).to(scores.device).to(scores.dtype)
+                                ranks[sorted_indices] = torch.arange(len(scores)).to(scores.device).to(scores.dtype)
+                                scores=ranks
+
+                            if pact_config.pruning_filter_wth_percentage :
+                                scores= scores.squeeze()
+                                num_elements = scores.numel()
+                                num_to_keep = int(num_elements * pact_config.pruning_tokeep_percentage_value)
+                                sorted_scores, _ = torch.sort(scores, descending=True)
+                                thresh_scores = sorted_scores[num_to_keep - 1]
+                            elif pact_config.use_IQR_in_token_pruning :
+                                q1 = torch.quantile(scores_flat, 0.25)
+                                q3 = torch.quantile(scores_flat, 0.75)
+                                thresh_scores = q1 + pact_config.alpha_IQR * (q3 - q1)
+
+                            first_mask = (scores >= thresh_scores).squeeze().bool()
+                                                            
+                        elif pact_config.prune_with_norm :
+                            norm=torch.norm(hidden_states[:,is_image].to(torch.float32), dim=-1,p=2).squeeze()
+                            scores= norm.squeeze()
+                            num_elements = scores.numel()
+                            num_to_keep = int(num_elements * pact_config.pruning_tokeep_percentage_value)
+                            sorted_scores, _ = torch.sort(scores, descending=True)
+                            thresh_scores = sorted_scores[num_to_keep - 1]
+                            first_mask = (scores > thresh_scores).squeeze().bool()
+
+                        elif pact_config.withdraw_visual_tokens :
+                            first_mask = torch.zeros_like(is_image.nonzero(), dtype=torch.bool).squeeze()
+
+                        else :
+                            first_mask=torch.ones_like(is_image.nonzero()).squeeze().bool()
+
+                        if pact_config.synchro or pact_config.get_reduction_ratio :
+                            self.reduction[0]+=first_mask.shape[0]
+                        first_mask_global=is_image.clone()
+                        first_mask_global[is_image]=first_mask.clone()
+
+
+                        ## clustering based reduction starts here
+                        
+                        if pact_config.use_DBDPC and index==pact_config.layer_for_reduction :
+                            #real_position_ids 3,1,seqlen
+                            real_position_ids_after_mask_image=real_position_ids.permute(2,1,0)[first_mask_global]  #N,3,1
+                            if not pact_config.include_pruned_in_mean :
+                                merged,second_mask,weights,position_ids_after_reduction=token_reduction(hidden_states[:,first_mask_global].squeeze(0),vector_to_use_in_distance_clustering[:,first_mask_global].squeeze(0),position_ids=real_position_ids_after_mask_image,reduction=self.reduction,cutoff=pact_config.cutoff,pact_config=pact_config)
+                            else :
+                                if pact_config.do_not_consider_non_image_tokens_as_pruned :
+                                    merged,second_mask,weights,position_ids_after_reduction=token_reduction(hidden_states[:,first_mask_global].squeeze(0),vector_to_use_in_distance_clustering[:,first_mask_global].squeeze(0),position_ids=real_position_ids_after_mask_image,reduction=self.reduction,cutoff=pact_config.cutoff,pruned_hiddens=hidden_states[:,is_image][:,~first_mask].squeeze(0),pruned_keys=vector_to_use_in_distance_clustering[:,is_image][:,~first_mask].squeeze(0),pact_config=pact_config)
+                                else :
+                                    merged,second_mask,weights,position_ids_after_reduction=token_reduction(hidden_states[:,first_mask_global].squeeze(0),vector_to_use_in_distance_clustering[:,first_mask_global].squeeze(0),position_ids=real_position_ids_after_mask_image,reduction=self.reduction,cutoff=pact_config.cutoff,pruned_hiddens=hidden_states[:,~first_mask_global].squeeze(0),pruned_keys=vector_to_use_in_distance_clustering[:,~first_mask_global].squeeze(0),pact_config=pact_config)
+                            if pact_config.get_mean_position_id:
+                                position_ids_after_reduction=position_ids_after_reduction.to(real_position_ids.dtype).permute(2,1,0)
+                                position_ids[:3,:,:][:,:,first_mask_global]=position_ids_after_reduction
+                                real_position_ids[:,:,first_mask_global]=position_ids_after_reduction
+
+                            hidden_states[:,first_mask_global]=merged.unsqueeze(0)
+                            second_mask=second_mask.squeeze()
+                            if pact_config.synchro or pact_config.get_reduction_ratio:
+                                self.reduction[1]+=second_mask.sum().item()
+
+                        elif pact_config.use_custom_merging and index==pact_config.layer_for_reduction :
+                            real_position_ids_after_mask_image=real_position_ids.permute(2,1,0)[first_mask_global]  #N,3,1
+                            
+                            if not pact_config.include_pruned_in_mean :
+                                merged,second_mask,weights,position_ids_after_reduction=custom_token_reduction(hidden_states[:,first_mask_global].squeeze(0), vector_to_use_in_distance_clustering[:,first_mask_global].squeeze(0), position_ids=real_position_ids_after_mask_image, cutoff=pact_config.cutoff)
+                            else :
+                                merged,second_mask,weights,position_ids_after_reduction=custom_token_reduction(hidden_states[:,first_mask_global].squeeze(0), vector_to_use_in_distance_clustering[:,first_mask_global].squeeze(0), position_ids=real_position_ids_after_mask_image, cutoff=pact_config.cutoff,pruned_hiddens=hidden_states[:,is_image][:,~first_mask].squeeze(0),pruned_for_reduction=vector_to_use_in_distance_clustering[:,is_image][:,~first_mask].squeeze(0))
+                            
+                            position_ids_after_reduction=position_ids_after_reduction.to(real_position_ids.dtype).permute(2,1,0)
+                            position_ids[:3,:,:][:,:,first_mask_global]=position_ids_after_reduction
+                            real_position_ids[:,:,first_mask_global]=position_ids_after_reduction
+                            hidden_states[:,first_mask_global]=merged.unsqueeze(0)
+                            second_mask=second_mask.squeeze()
+                            if pact_config.synchro or pact_config.get_reduction_ratio:
+                                self.reduction[1]+=second_mask.sum().item()
+                        elif pact_config.use_tome :
+                            if index>=1 :
+                                sizes=torch.exp(self.weights[index-1].squeeze()[first_mask_global]) #we store weights as log values so need to revert them back
+                            else :
+                                sizes=torch.ones_like(hidden_states[:,first_mask_global].squeeze()[:,0])
+                            n_layers=len(self.layers)
+                            if index==0 :
+                                effective_percentage_to_keep=1-(1-pact_config.perc_tokeep_tome_total)*((n_layers-pact_config.tome_equivalant_layer_for_reduction)/n_layers)
+                                r_intial=6*n_layers*(1-effective_percentage_to_keep)/((n_layers+1)*(2*n_layers+1)) *(is_image.sum())
+                            r=int(r_intial*((n_layers-index)/n_layers))+1
+                            merged,second_mask,weights,_=token_reduction_tome(hidden_states[:,first_mask_global].squeeze(0),vector_to_use_in_distance_clustering[:,first_mask_global].squeeze(0), sizes,reduction=self.reduction,r=r)
+                            if pact_config.take_mean :
+                                hidden_states[:,first_mask_global]=merged.unsqueeze(0)
+                            second_mask=second_mask.squeeze()
+                            
+                        elif pact_config.use_kmeans and index==pact_config.layer_for_reduction :
+                            k=int(pact_config.perc_tokeep_kmeans*is_image.sum())
+                            merged,second_mask,weights,_=token_reduction_kmeans(hidden_states[:,first_mask_global].squeeze(0),vector_to_use_in_distance_clustering[:,first_mask_global].squeeze(0), k=k)
+                            hidden_states[:,first_mask_global]=merged.unsqueeze(0)
+                            second_mask=second_mask.squeeze()
+                            if pact_config.synchro or pact_config.get_reduction_ratio:
+                                self.reduction[1]+=second_mask.sum().item()
+                        elif pact_config.use_dpc and index==pact_config.layer_for_reduction :
+                            merged,second_mask,weights,_=token_reduction_dpc(hidden_states[:,first_mask_global].squeeze(0),vector_to_use_in_distance_clustering[:,first_mask_global].squeeze(0), pact_config.percentage_to_keep_dpc,reduction=self.reduction)
+                            hidden_states[:,first_mask_global]=merged.unsqueeze(0)
+                            second_mask=second_mask.squeeze()
+                            if pact_config.synchro or pact_config.get_reduction_ratio:
+                                self.reduction[1]+=second_mask.sum().item()
+                        elif pact_config.use_dbscan and index==pact_config.layer_for_reduction :
+                            merged,second_mask,weights,_=token_reduction_dbscan(hidden_states[:,first_mask_global].squeeze(0),vector_to_use_in_distance_clustering[:,first_mask_global].squeeze(0), eps=pact_config.eps_dbscan,isolate_noise_as_clusters=pact_config.noise_as_clusters_dbscan,reduction=self.reduction)
+                            hidden_states[:,first_mask_global]=merged.unsqueeze(0)
+                            second_mask=second_mask.squeeze()
+                            if pact_config.synchro or pact_config.get_reduction_ratio:
+                                self.reduction[1]+=second_mask.sum().item()
+                        elif pact_config.use_agglomerative and index==pact_config.layer_for_reduction :
+                            merged,second_mask,weights,_=token_reduction_agglomerative(hidden_states[:,first_mask_global].squeeze(0),vector_to_use_in_distance_clustering[:,first_mask_global].squeeze(0), pact_config.percentage_to_keep_agglomerative,reduction=self.reduction,linkage=pact_config.linkage)
+                            hidden_states[:,first_mask_global]=merged.unsqueeze(0)
+                            second_mask=second_mask.squeeze()
+                            if pact_config.synchro or pact_config.get_reduction_ratio:
+                                self.reduction[1]+=second_mask.sum().item()
+                        else :
+                            second_mask=torch.ones_like(first_mask_global.nonzero()).squeeze().bool()
+                            if index==pact_config.layer_for_reduction :
+                                weights=torch.ones_like(second_mask).to(hidden_states.dtype)
+                            else :
+                                weights=self.weights[index-1].squeeze()[first_mask_global]
+                            if pact_config.synchro or pact_config.get_reduction_ratio:
+                                self.reduction[1]+=second_mask.sum().item()
+
+                        weights_final=torch.ones_like(is_image).to(torch.float16)
+                        weights_final[first_mask_global]=weights.to(torch.float16)
+                        weights=weights_final.unsqueeze(0)
+
+                        mask_final=torch.ones_like(is_image).bool()
+                        mask_final[is_image]= first_mask
+                        mask_final[first_mask_global]=second_mask
+                        
+                        position_ids=position_ids[:,:,mask_final]
+                        hidden_states=hidden_states[:,mask_final]
+                        real_position_ids=real_position_ids[:,:,mask_final]
+                        cache_position=cache_position[mask_final.squeeze()]
+                        position_embeddings=(position_embeddings[0][:,:,mask_final],position_embeddings[1][:,:,mask_final])
+                        weights = weights[:,mask_final]
+                        weights = torch.log(weights)
+
+                        if pact_config.need_kq :
+                            is_not_text=is_not_text[mask_final]
+                        is_image=is_image[mask_final]
+                        if pact_config.progessive_reduction :
+                            if index==pact_config.layer_for_reduction :
+                                self.weights=dict()
+                            self.weights[index]=weights
+                        else :
+                            self.weights=weights
+
+                        weights_forward=weights
+
+                        seq_len = real_position_ids.shape[2]
+                        weights_forward=weights_forward.squeeze().unsqueeze(0).repeat(seq_len,1)
+                        
+                        weights_forward=weights_forward.to(hidden_states.dtype).unsqueeze(0).unsqueeze(0)
+                        if pact_config.get_performance_metrics :
+                            torch.cuda.synchronize() 
+                            self.total_algo_time+=time.time()-start_algo
+
+                    elif is_reduction_layer : 
+                        if pact_config.progessive_reduction :
+                            self.weights[index]=torch.cat((self.weights[index],torch.zeros(self.weights[index].size(0), hidden_states.shape[1], device=self.weights[index].device)),dim=-1)
+                            weights_forward=self.weights[index]
+                        else :
+                            self.weights=torch.cat((self.weights,torch.zeros(self.weights.size(0), hidden_states.shape[1], device=self.weights.device)),dim=-1)
+                            weights_forward=self.weights
+                        
+                        seq_len = real_position_ids.shape[2]
+                        weights_forward=weights_forward.squeeze().unsqueeze(0).repeat(seq_len,1)
+                        weights_forward=weights_forward.to(hidden_states.dtype).unsqueeze(0).unsqueeze(0)
+
+                if pact_config.visual_token_reduction and pact_config.synchro and image_in_input:
+                    self.mean_visual_tokens_all[0]+=position_ids[3:,:,:].bool().squeeze().sum().item()
+
+                if weights_forward is not None and pact_config.no_proportional_attention :
+                    weights_forward=None
+
+                if pact_config.change_position_ids and image_in_input :
+                    batch_size, seq_len = real_position_ids.shape
+                    real_position_ids[:] = torch.arange(seq_len).unsqueeze(0).expand(batch_size, seq_len).to(real_position_ids.device).to(real_position_ids.dtype)
+                # print(f"当前分配显存: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
+                # torch.cuda.empty_cache()
+                end = time.time()
+                # print("裁减耗时：", end -start)
                 layer_outputs = decoder_layer(
                     hidden_states,
                     attention_mask=causal_mask,
@@ -1392,6 +1724,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         self.visual = Qwen2_5_VisionTransformerPretrainedModel._from_config(config.vision_config)
         self.language_model = Qwen2_5_VLTextModel._from_config(config.text_config)
         self.rope_deltas = None  # cache rope_deltas here
+        self.total_time=[0,0]
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -1648,13 +1981,14 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         second_per_grid_ts (`torch.Tensor` of shape `(num_videos)`, *optional*):
             The time interval (in seconds) for each grid along the temporal dimension in the 3D position IDs.
         """
-
+        # import pdb
+        # pdb.set_trace()
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
+        # print(f"当前分配显存: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
         if inputs_embeds is None:
             inputs_embeds = self.get_input_embeddings()(input_ids)
             if pixel_values is not None:
@@ -1673,7 +2007,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
 
                 image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
                 inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
-
+            # print(f"当前分配显存: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
             if pixel_values_videos is not None:
                 video_embeds = self.get_video_features(pixel_values_videos, video_grid_thw)
                 n_video_tokens = (input_ids == self.config.video_token_id).sum().item()
@@ -1693,6 +2027,25 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
 
             if attention_mask is not None:
                 attention_mask = attention_mask.to(inputs_embeds.device)
+
+        if pixel_values is not None:
+            image_mask=(
+                    (input_ids == self.config.image_token_id)
+                    .unsqueeze(0)
+                    .to(inputs_embeds.device)
+                )
+        else :
+            image_mask=torch.zeros_like(input_ids).unsqueeze(0).to(inputs_embeds.device)
+
+        if pixel_values_videos is not None:
+            video_mask= video_mask = (
+                    (input_ids == self.config.video_token_id)
+                    .unsqueeze(0)
+                    .to(inputs_embeds.device)
+                )
+        
+        else :
+            video_mask=torch.zeros_like(input_ids).unsqueeze(0).to(inputs_embeds.device)
 
         # if we get 4D attention mask we cannot calculate rope deltas anymore. TODO @raushan fixme
         if position_ids is None and (attention_mask is None or attention_mask.ndim == 2):
@@ -1725,6 +2078,17 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
                 position_ids = position_ids.add(delta)
                 position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
 
+
+        visual_mask = image_mask | video_mask
+        if torch.any(visual_mask):
+            position_ids=torch.cat((position_ids, visual_mask),dim=0)
+        # torch.cuda.synchronize()
+        # start=time.time()
+        # import pdb
+        # pdb.set_trace()
+        if position_ids.shape[2]!=1:
+            self.total_time[1]+=1
+            # print("一个样本只打印一次？")
         outputs = self.language_model(
             input_ids=None,
             position_ids=position_ids,
@@ -1798,6 +2162,7 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         super().__init__(config)
         self.model = Qwen2_5_VLModel(config)
         self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
+        
 
         self.post_init()
 
@@ -1904,7 +2269,8 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
+        torch.cuda.synchronize()
+        start = time.time()
         outputs = self.model(
             input_ids=input_ids,
             pixel_values=pixel_values,
@@ -1922,7 +2288,8 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             return_dict=return_dict,
             cache_position=cache_position,
         )
-
+        torch.cuda.synchronize()
+        self.model.total_time[0] += time.time() - start
         hidden_states = outputs[0]
         logits = self.lm_head(hidden_states)
 
