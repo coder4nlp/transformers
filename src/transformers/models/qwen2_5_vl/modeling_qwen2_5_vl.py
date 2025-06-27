@@ -2214,6 +2214,7 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         rope_deltas: Optional[torch.LongTensor] = None,
         cache_position: Optional[torch.LongTensor] = None,
         second_per_grid_ts: Optional[torch.Tensor] = None,
+        is_generation: Optional[bool] = None,
     ) -> Union[Tuple, Qwen2_5_VLCausalLMOutputWithPast]:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
@@ -2291,6 +2292,11 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         torch.cuda.synchronize()
         self.model.total_time[0] += time.time() - start
         hidden_states = outputs[0]
+        # 如果是推理模型，并且labels为空，只需要最后一个时刻的输出，节省显存
+        if not self.training and labels is None:
+            if is_generation:
+                hidden_states = hidden_states[:, -1, :]
+
         logits = self.lm_head(hidden_states)
 
         loss = None
@@ -2350,7 +2356,7 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         if cache_position[0] != 0:
             model_inputs["pixel_values"] = None
             model_inputs["pixel_values_videos"] = None
-
+        model_inputs['"is_generation"'] = True
         return model_inputs
 
     def _get_image_nums_and_video_nums(
